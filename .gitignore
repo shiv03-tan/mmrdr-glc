@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pt
+*.pth
+*.csv
+*.png
+*.xlsx
+outputs/
+data/
+runs/
+New Text Document.txt
