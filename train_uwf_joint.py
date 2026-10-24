@@ -104,6 +104,8 @@ def arguments():
     p.add_argument('--batch-size', type=int, default=4)
     p.add_argument('--accumulation', type=int, default=4)
     p.add_argument('--workers', type=int, default=0)
+    p.add_argument('--prefetch', type=int, default=1,
+                   help='batches each worker holds in advance; 1 keeps 8 workers inside a 64 MB /dev/shm')
     p.add_argument('--epochs', type=int, default=60)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--encoder-lr', type=float, default=1e-5)
@@ -126,6 +128,8 @@ def arguments():
     if BACKBONES[a.backbone][2] == 'file' and not a.audit_only:
         if a.weights is None or not a.weights.is_file():
             p.error(f'{a.backbone} needs --weights pointing to a downloaded checkpoint file')
+    if a.prefetch < 1:
+        p.error('--prefetch must be >= 1')
     if a.workers > 0 and os.name == 'nt':
         p.error('workers > 0 is not supported on Windows; use --workers 0')
     if a.image_size is None:
@@ -168,8 +172,9 @@ def load_training_components():
                        T.RandomRotation(15, interpolation=InterpolationMode.BILINEAR, expand=True, fill=0),
                        T.ColorJitter(brightness=.1, contrast=.1, saturation=.1)]
             self.transform = T.Compose(ops + [Square(),
-                T.Resize((size, size), interpolation=InterpolationMode.BILINEAR), T.ToTensor(),
-                T.Normalize((.485, .456, .406), (.229, .224, .225))])
+                T.Resize((size, size), interpolation=InterpolationMode.BILINEAR), T.PILToTensor()])
+            # uint8 leaves the worker (4x less shared memory); to_input() does ToTensor's /255
+            # and the ImageNet normalization on the device, giving the same values.
 
         def __len__(self):
             return len(self.rows)
@@ -301,6 +306,15 @@ def load_vit_checkpoint(model, path):
     return {'weights_file': str(path), 'weights_sha256': sha(path),
             'missing_keys': missing, 'unexpected_keys': list(result.unexpected_keys)[:50]}
 
+MEAN, STD = (.485, .456, .406), (.229, .224, .225)
+
+def to_input(x, device):
+    """uint8 (B,3,H,W) -> normalized float32 on device; equals ToTensor + Normalize."""
+    x = x.to(device, non_blocking=True).float().div_(255)
+    mean = torch.tensor(MEAN, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(STD, device=device).view(1, 3, 1, 1)
+    return (x - mean) / std
+
 def lesion_elements(logits, targets, kind):
     if kind == 'bce':
         return F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
@@ -355,7 +369,7 @@ def evaluate(model, loader, device, amp):
     ys, ls, gps, lps, paths = [], [], [], [], []
     with torch.inference_mode():
         for batch in loader:
-            x = batch['image'].to(device)
+            x = to_input(batch['image'], device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
                 out = model(x)
             gp, lp = out['pg'].float(), out['pl'].float()
@@ -452,7 +466,7 @@ def main():
     generator = torch.Generator().manual_seed(args.seed)
     loader_kw = dict(batch_size=args.batch_size, num_workers=args.workers, pin_memory=device.type == 'cuda',
                      worker_init_fn=seed_worker if args.workers else None,
-                     persistent_workers=args.workers > 0)
+                     prefetch_factor=args.prefetch if args.workers else None, persistent_workers=False)
     train = torch.utils.data.DataLoader(Images(tr, args.image_root, True, args.image_size),
                                         shuffle=True, generator=generator, **loader_kw)
     val = torch.utils.data.DataLoader(Images(va, args.image_root, False, args.image_size),
@@ -488,7 +502,7 @@ def main():
                 weight = args.consistency_weight * min(1., progress/5)
                 optimizer.zero_grad(set_to_none=True)
                 for batch in window:
-                    x = batch['image'].to(device)
+                    x = to_input(batch['image'], device)
                     y = batch['grade'].to(device)
                     lab, mask, ok = (batch[k].to(device) for k in ('lesions', 'mask', 'eligible'))
                     if not torch.isfinite(x).all():
