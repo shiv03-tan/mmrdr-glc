@@ -110,10 +110,11 @@ class JointGradeLesionHead(nn.Module):
         p_lesion = (p @ self.L).clamp(1e-7, 1 - 1e-7)
         return p_grade, p_lesion, logp
 
-    def nll(self, logp, y_grade, y_lesion, lesion_mask=None):
+    def nll(self, logp, y_grade, y_lesion, lesion_mask=None, reduction="mean"):
         """
         y_grade: (B,) long; y_lesion: (B,7) {0,1}; lesion_mask: (B,7) {0,1},
-        1 = label observed, 0 = marginalize. Returns (mean loss, n_skipped).
+        1 = label observed, 0 = marginalize. Returns (loss, n_skipped);
+        reduction 'mean' averages over usable rows, 'sum' sums them.
         """
         if lesion_mask is None:
             lesion_mask = torch.ones_like(y_lesion)
@@ -129,11 +130,13 @@ class JointGradeLesionHead(nn.Module):
             return logp.sum() * 0.0, n_skipped
         masked = logp[ok].masked_fill(~compat[ok], float("-inf"))
         ll = torch.logsumexp(masked, dim=1)
-        return -ll.mean(), n_skipped
+        return (-ll.sum() if reduction == "sum" else -ll.mean()), n_skipped
 
 
-def asl_on_probs(p, y, mask=None, gamma_pos=0.0, gamma_neg=4.0, clip=0.05):
-    """Asymmetric loss on probabilities (same settings as the paper's baseline)."""
+def asl_on_probs(p, y, mask=None, gamma_pos=0.0, gamma_neg=4.0, clip=0.05,
+                 reduction="mean"):
+    """Asymmetric loss on probabilities (same settings as the paper's baseline).
+    reduction 'none' returns the (B,7) elementwise loss (mask already applied)."""
     y = y.float()
     p_neg = (p - clip).clamp(min=0) if clip > 0 else p
     with torch.no_grad():
@@ -143,6 +146,9 @@ def asl_on_probs(p, y, mask=None, gamma_pos=0.0, gamma_neg=4.0, clip=0.05):
              + (1 - y) * w_neg * torch.log((1 - p_neg).clamp(min=1e-8)))
     if mask is not None:
         loss = loss * mask
+    if reduction == "none":
+        return loss
+    if mask is not None:
         return loss.sum() / mask.sum().clamp(min=1)
     return loss.mean()
 
