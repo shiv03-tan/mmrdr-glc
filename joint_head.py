@@ -127,7 +127,8 @@ class JointGradeLesionHead(nn.Module):
         ok = (compat & torch.isfinite(logp)).any(1)
         n_skipped = int((~ok).sum())
         if ok.sum() == 0:
-            return logp.sum() * 0.0, n_skipped
+            # zero that stays in the graph; logp may hold -inf, and -inf * 0 is NaN
+            return logp.masked_fill(~torch.isfinite(logp), 0.0).sum() * 0.0, n_skipped
         masked = logp[ok].masked_fill(~compat[ok], float("-inf"))
         ll = torch.logsumexp(masked, dim=1)
         return (-ll.sum() if reduction == "sum" else -ll.mean()), n_skipped
@@ -195,6 +196,15 @@ if __name__ == "__main__":
         assert h.grad is not None and torch.isfinite(h.grad).all()
         h.grad = None
         print(f"{mode:5s} loss={loss.item():.4f} skipped={info['n_skipped']}")
+
+    # hard mode: a batch whose labels all break a rule must give a finite zero loss
+    head = JointGradeLesionHead(512, mode="hard")
+    hb = torch.randn(2, 512, requires_grad=True)
+    _, _, lp = head(hb)
+    bad_l = torch.zeros(2, 7, dtype=torch.long)
+    z, ns = head.nll(lp, torch.tensor([1, 4]), bad_l, reduction="sum")
+    z.backward()
+    assert ns == 2 and z.item() == 0.0 and torch.isfinite(hb.grad).all()
 
     # hard mode: invalid states must have zero mass
     head = JointGradeLesionHead(512, mode="hard")
