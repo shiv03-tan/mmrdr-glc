@@ -114,6 +114,8 @@ def arguments():
     p.add_argument('--consistency-weight', type=float, default=0.0,
                    help='GLC penalty; independent head only')
     p.add_argument('--precision', choices=['auto', 'fp32'], default='auto')
+    p.add_argument('--resume', action='store_true',
+                   help='continue an interrupted full run from <out-dir>/last.pt with identical settings')
     a = p.parse_args()
     if min(a.batch_size, a.accumulation) < 1 or a.epochs <= 5 or a.workers < 0:
         p.error('Positive batch/accumulation, epochs > 5 and workers >= 0 required')
@@ -134,6 +136,8 @@ def arguments():
         p.error('workers > 0 is not supported on Windows; use --workers 0')
     if a.image_size is None:
         a.image_size = BACKBONES[a.backbone][1]
+    if a.resume and a.mode != 'full':
+        p.error('--resume applies to --mode full only')
     if not a.audit_only and a.out_dir is None:
         p.error('--out-dir is required for smoke/full training')
     return a
@@ -430,7 +434,23 @@ def main():
     # ViT attention kernels have no fully deterministic backward; warn instead of failing.
     vit = BACKBONES[args.backbone][0] is not None
     torch.use_deterministic_algorithms(True, warn_only=vit)
-    args.out_dir.mkdir(parents=True, exist_ok=False)
+    if args.resume:
+        if not (args.out_dir/'last.pt').is_file() or not (args.out_dir/'config.json').is_file():
+            raise FileNotFoundError(f'--resume needs {args.out_dir}/last.pt and config.json')
+        if (args.out_dir/'completed.json').is_file():
+            raise RuntimeError(f'{args.out_dir} already completed; nothing to resume')
+        old = json.loads((args.out_dir/'config.json').read_text(encoding='utf-8'))
+        now = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+        keys = ('backbone', 'weights', 'image_size', 'head', 'joint_mode', 'joint_nll_weight', 'joint_asl_weight',
+                'joint_ce_weight', 'batch_size', 'accumulation', 'epochs', 'seed', 'encoder_lr', 'head_lr',
+                'lesion_loss', 'consistency_weight', 'precision', 'mode')
+        diff = {k: (old.get(k), now.get(k)) for k in keys if old.get(k) != now.get(k)}
+        if diff:
+            raise ValueError(f'--resume settings differ from the original run: {diff}')
+        if old.get('train_sha256') != sha(args.train_manifest) or old.get('val_sha256') != sha(args.val_manifest):
+            raise ValueError('--resume manifests differ from the original run')
+    else:
+        args.out_dir.mkdir(parents=True, exist_ok=False)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     config.update(version='uwf-joint-v2', lesions=LESIONS,
         train_sha256=sha(args.train_manifest), val_sha256=sha(args.val_manifest), script_sha256=sha(__file__),
@@ -452,10 +472,11 @@ def main():
     if hasattr(model.body, 'load_report'):
         config['weights_load'] = model.body.load_report
         print(json.dumps(model.body.load_report), flush=True)
-    (args.out_dir/'config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
-    (args.out_dir/'manifest_audit.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
-    shutil.copyfile(__file__, args.out_dir/'train_uwf_joint_used.py')
-    shutil.copyfile(Path(__file__).resolve().parent / 'joint_head.py', args.out_dir/'joint_head_used.py')
+    if not args.resume:
+        (args.out_dir/'config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
+        (args.out_dir/'manifest_audit.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+        shutil.copyfile(__file__, args.out_dir/'train_uwf_joint_used.py')
+        shutil.copyfile(Path(__file__).resolve().parent / 'joint_head.py', args.out_dir/'joint_head_used.py')
     groups = {}
     for name, p in model.named_parameters():
         lr = args.encoder_lr if model.encoder_parameter(name) else args.head_lr
@@ -477,10 +498,36 @@ def main():
         torch.cuda.reset_peak_memory_stats()
     best, start = -math.inf, time.perf_counter()
     history = []
+    first_epoch = 1
+    if args.resume:
+        state = torch.load(args.out_dir/'last.pt', map_location=device, weights_only=False)
+        model.load_state_dict(state['model'])
+        optimizer.load_state_dict(state['optimizer'])
+        first_epoch = int(state['epoch']) + 1
+        with (args.out_dir/'history.csv').open(encoding='utf-8', newline='') as f:
+            for row in csv.DictReader(f):
+                row = {k: float(v) for k, v in row.items()}
+                if row['epoch'] <= state['epoch']:
+                    history.append(row)
+        if len(history) != state['epoch']:
+            raise RuntimeError('history.csv does not match last.pt')
+        best = max(h['selection_score'] for h in history)
+        start -= history[-1]['elapsed_seconds']
+        # fresh, recorded RNG streams for the remaining epochs (not bit-identical to an uninterrupted run)
+        rs = args.seed * 1000 + first_epoch
+        random.seed(rs); np.random.seed(rs); torch.manual_seed(rs); torch.cuda.manual_seed_all(rs)
+        generator.manual_seed(rs)
+        note = {'resumed_at_epoch': first_epoch, 'rng_seed_after_resume': rs, 'best_so_far': best,
+                'gpu': config['gpu'], 'torch': config['torch'], 'script_sha256': config['script_sha256'],
+                'time': time.strftime('%Y-%m-%d %H:%M:%S')}
+        (args.out_dir/f'resume_epoch{first_epoch}.json').write_text(json.dumps(note, indent=2), encoding='utf-8')
+        print('RESUMING ' + json.dumps(note), flush=True)
+        if first_epoch > args.epochs:
+            raise RuntimeError('last.pt is already at the final epoch')
     joint = args.head == 'joint'
     epoch = 0
     try:
-        for epoch in range(1, (1 if args.mode=='smoke' else args.epochs)+1):
+        for epoch in range(first_epoch, (1 if args.mode=='smoke' else args.epochs)+1):
             model.train()
             n_batches = min(20, len(train)) if args.mode=='smoke' else len(train)
             stream = iter(itertools.islice(train, n_batches))
